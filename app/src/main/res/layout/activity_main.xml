@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:gravity="center_horizontal">
+
+    <TextView
+        android:id="@+id/instructions"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="15sp"
+        android:paddingBottom="16dp"
+        android:text="1. Open Amazon Music and start playing a song first.\n2. Come back here and tap Start Test.\n3. Approve the screen-capture prompt (required by Android for any audio capture, even audio-only).\n4. Let it run for 8 seconds while Amazon Music keeps playing.\n5. Read the result below." />
+
+    <Button
+        android:id="@+id/startButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Start Test" />
+
+    <TextView
+        android:id="@+id/statusText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingTop="24dp"
+        android:textSize="16sp"
+        android:text="Status: idle" />
+
+</LinearLayout>
