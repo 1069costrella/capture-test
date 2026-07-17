@@ -6,21 +6,19 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.AudioAttributes
+import android.content.pm.ServiceInfo
 import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
-import androidx.core.app.NotificationCompat
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -43,13 +41,19 @@ class CaptureService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIF_ID, buildNotification())
+        try {
+            startAsForeground()
+        } catch (t: Throwable) {
+            broadcastResult("Failed to start foreground service: ${t.message}")
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, -1) ?: -1
-        val resultData = intent?.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+        val resultData: Intent? = intent?.getParcelableExtra(EXTRA_RESULT_DATA)
 
-        if (resultData == null) {
-            broadcastResult("missing projection data, aborting")
+        if (resultData == null || resultCode == -1) {
+            broadcastResult("Missing projection permission data.")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -58,39 +62,59 @@ class CaptureService : Service() {
             getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
 
-        CoroutineScope(Dispatchers.Default).launch {
-            runCapture()
-        }
-
+        Thread { runCapture() }.start()
         return START_NOT_STICKY
+    }
+
+    private fun startAsForeground() {
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIF_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+        } else {
+            startForeground(NOTIF_ID, notification)
+        }
     }
 
     private fun runCapture() {
         val projection = mediaProjection
         if (projection == null) {
-            broadcastResult("could not obtain MediaProjection")
+            broadcastResult("Could not obtain MediaProjection.")
             stopSelf()
             return
         }
 
-        // Look up Amazon Music's uid so we only capture audio from that app specifically.
         val amazonUid = try {
             packageManager.getApplicationInfo(AMAZON_MUSIC_PACKAGE, 0).uid
         } catch (e: PackageManager.NameNotFoundException) {
-            broadcastResult("Amazon Music not installed")
+            broadcastResult("Amazon Music not installed.")
             stopSelf()
             return
         }
 
-        val captureConfig = android.media.AudioPlaybackCaptureConfiguration.Builder(projection)
-            .addMatchingUid(amazonUid)
-            .build()
+        val captureConfig = try {
+            AudioPlaybackCaptureConfiguration.Builder(projection)
+                .addMatchingUid(amazonUid)
+                .build()
+        } catch (t: Throwable) {
+            broadcastResult("Failed to build capture config: ${t.message}")
+            stopSelf()
+            return
+        }
 
         val minBufferSize = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         )
+        if (minBufferSize <= 0) {
+            broadcastResult("Invalid audio buffer size ($minBufferSize).")
+            stopSelf()
+            return
+        }
 
         val audioFormat = AudioFormat.Builder()
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
@@ -98,9 +122,8 @@ class CaptureService : Service() {
             .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
             .build()
 
-        val audioRecord: AudioRecord
-        try {
-            audioRecord = AudioRecord.Builder()
+        val audioRecord: AudioRecord = try {
+            AudioRecord.Builder()
                 .setAudioFormat(audioFormat)
                 .setBufferSizeInBytes(minBufferSize * 4)
                 .setAudioPlaybackCaptureConfig(captureConfig)
@@ -109,14 +132,15 @@ class CaptureService : Service() {
             broadcastResult("SecurityException creating AudioRecord: ${e.message}")
             stopSelf()
             return
-        } catch (e: Exception) {
-            broadcastResult("Failed to build AudioRecord: ${e.message}")
+        } catch (t: Throwable) {
+            broadcastResult("Failed to build AudioRecord: ${t.message}")
             stopSelf()
             return
         }
 
         if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
-            broadcastResult("AudioRecord failed to initialize (state=${audioRecord.state})")
+            broadcastResult("AudioRecord failed to initialize (state=${audioRecord.state}).")
+            audioRecord.release()
             projection.stop()
             stopSelf()
             return
@@ -126,48 +150,49 @@ class CaptureService : Service() {
             getExternalFilesDir(Environment.DIRECTORY_MUSIC),
             "capture_test_raw.pcm"
         )
-        val outputStream = FileOutputStream(pcmFile)
 
         val buffer = ShortArray(minBufferSize)
         var peakAmplitude = 0
         var totalSamples = 0L
         val samplesNeeded = SAMPLE_RATE.toLong() * CAPTURE_SECONDS
 
-        audioRecord.startRecording()
-
-        while (totalSamples < samplesNeeded) {
-            val read = audioRecord.read(buffer, 0, buffer.size)
-            if (read > 0) {
-                for (i in 0 until read) {
-                    peakAmplitude = max(peakAmplitude, abs(buffer[i].toInt()))
+        try {
+            val outputStream = FileOutputStream(pcmFile)
+            audioRecord.startRecording()
+            while (totalSamples < samplesNeeded) {
+                val read = audioRecord.read(buffer, 0, buffer.size)
+                if (read > 0) {
+                    for (i in 0 until read) {
+                        peakAmplitude = max(peakAmplitude, abs(buffer[i].toInt()))
+                    }
+                    val bb = ByteBuffer.allocate(read * 2).order(ByteOrder.LITTLE_ENDIAN)
+                    for (i in 0 until read) bb.putShort(buffer[i])
+                    outputStream.write(bb.array())
+                    totalSamples += read
+                } else if (read < 0) {
+                    broadcastResult("AudioRecord.read error code $read.")
+                    break
                 }
-                val byteBuffer = java.nio.ByteBuffer.allocate(read * 2)
-                byteBuffer.order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                for (i in 0 until read) {
-                    byteBuffer.putShort(buffer[i])
-                }
-                outputStream.write(byteBuffer.array())
-                totalSamples += read
             }
+            audioRecord.stop()
+            outputStream.close()
+        } catch (t: Throwable) {
+            broadcastResult("Capture loop error: ${t.message}")
+        } finally {
+            audioRecord.release()
+            projection.stop()
         }
 
-        audioRecord.stop()
-        audioRecord.release()
-        outputStream.close()
-        projection.stop()
-
-        // A silent digital capture (near-zero peak amplitude for the whole window) strongly
-        // suggests Amazon Music has set ALLOW_CAPTURE_BY_NONE (or the audio session is opted
-        // out), since a genuinely playing/loud track would show non-trivial amplitude.
         val percentOfMax = (peakAmplitude / 32767.0) * 100
         val message = if (peakAmplitude < 50) {
-            "SILENT capture (peak ${"%.2f".format(percentOfMax)}% of max). " +
-                "Amazon Music likely blocks playback capture (ALLOW_CAPTURE_BY_NONE), " +
-                "or it wasn't playing. Raw PCM saved to ${pcmFile.absolutePath}"
+            "SILENT capture (peak ${"%.2f".format(percentOfMax)}% of max).\n\n" +
+                "Amazon Music likely BLOCKS playback capture (ALLOW_CAPTURE_BY_NONE) " +
+                "-- or it simply wasn't playing during the test. If it was definitely " +
+                "playing out loud, that's your answer: software capture won't work."
         } else {
-            "AUDIO CAPTURED (peak ${"%.2f".format(percentOfMax)}% of max). " +
-                "Amazon Music does NOT block playback capture on this device/version. " +
-                "Raw PCM saved to ${pcmFile.absolutePath}"
+            "AUDIO CAPTURED (peak ${"%.2f".format(percentOfMax)}% of max).\n\n" +
+                "Amazon Music does NOT block playback capture on this device/OS. " +
+                "A software middleware approach is technically viable."
         }
 
         broadcastResult(message)
@@ -183,16 +208,16 @@ class CaptureService : Service() {
     }
 
     private fun buildNotification(): Notification {
+        val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Capture Probe",
                 NotificationManager.IMPORTANCE_LOW
             )
-            val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(channel)
         }
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Capture Probe running")
             .setContentText("Testing Amazon Music audio capture...")
             .setSmallIcon(android.R.drawable.ic_menu_info_details)
