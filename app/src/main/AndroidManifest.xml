@@ -6,7 +6,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Needed on API 30+ to look up Amazon Music's package/uid by name -->
     <queries>
         <package android:name="com.amazon.mp3" />
     </queries>
